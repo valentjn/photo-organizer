@@ -6,15 +6,23 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
+import contextlib
 import datetime
 import glob
 import hashlib
+import os
 import pathlib
 import re
+import shutil
+import ssl
 import sys
+import tempfile
 from typing import Any
+import urllib.request
+import zipfile
 
+import certifi
 import exiftool
 
 
@@ -95,7 +103,10 @@ def get_rename_dict(old_media_paths: Sequence[pathlib.Path]) -> dict[pathlib.Pat
     :param old_media_paths: Sequence of media paths before renaming.
     :return: Dict from old media paths to renamed media paths.
     """
-    with exiftool.ExifToolHelper() as exif_tool_helper:
+    with contextlib.ExitStack() as exit_stack:
+        if (sys.platform == "win32") and (shutil.which("exiftool.exe") is None):
+            exit_stack.enter_context(download_exiftool_on_windows())
+        exif_tool_helper = exit_stack.enter_context(exiftool.ExifToolHelper())
         print("Retrieving metadata of {} file{}...".format(
             len(old_media_paths),
             "" if len(old_media_paths) == 1 else "s",
@@ -153,6 +164,49 @@ def get_creation_datetime(metadata: dict[str, Any]) -> datetime.datetime | None:
         int(regex_match.group("minute")),
         int(regex_match.group("second")),
     )
+
+
+@contextlib.contextmanager
+def download_exiftool_on_windows() -> Generator[pathlib.Path, None, None]:
+    """Download ExifTool on Windows and place it in the ``PATH``.
+
+    :return: Generator yielding the path of the ExifTool executable once. The executable is placed
+    in a temporary directory, which is cleaned up when the generator resumes. In addition, the
+    ``PATH`` is reset to its value before calling this function.
+    """
+    archive_filename = "exiftool-12.67.zip"
+    url = f"https://exiftool.org/{archive_filename}"
+    print(
+        f"Downloading exiftool from `{url}`... (You can skip this by installing exiftool and "
+        "adding its directory to your `PATH`.)"
+    )
+    with tempfile.TemporaryDirectory() as temporary_directory_string:
+        temporary_directory = pathlib.Path(temporary_directory_string)
+        archive_path = temporary_directory / archive_filename
+        # Work around nasty SSL error "certificate has expired" due to the Let's Encrypt
+        # certificate not in my trusted root certificate store.
+        with urllib.request.urlopen(
+            url,
+            context=ssl.create_default_context(cafile=certifi.where()),
+        ) as response:
+            archive_path.write_bytes(response.read())
+        executable_in_archive_filename = "exiftool(-k).exe"
+        executable_filename = "exiftool.exe"
+        with zipfile.ZipFile(archive_path, "r") as zip_file:
+            zip_file.getinfo(executable_in_archive_filename).filename = executable_filename
+            zip_file.extract(executable_in_archive_filename, temporary_directory)
+        archive_path.unlink()
+        original_path = os.environ.get("PATH")
+        os.environ["PATH"] = "{}{}{}".format(
+            temporary_directory,
+            os.pathsep,
+            os.environ.get("PATH", ""),
+        )
+        yield temporary_directory / executable_filename
+        if original_path is None:
+            del os.environ["PATH"]
+        else:
+            os.environ["PATH"] = original_path
 
 
 def format_media_path(
